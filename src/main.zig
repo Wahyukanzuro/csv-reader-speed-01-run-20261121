@@ -1,57 +1,74 @@
-// csv-reader-speed-01 v2: WASM SIMD128 JSON-to-JSON CSV transducer.
+// csv-reader-speed-01 v6: v4 (in-memory single-pass) + clean-line
+// multi-comma @ctz fast path.
 //
-// Architecture (encoded-text approach):
-// - main.ts reads /input/cases.json as a raw Buffer, copies it to WASM linear
-//   memory at 0, calls run_json(0, len). The WASM parses the JSON structure,
-//   runs the CSV engine DIRECTLY on the JSON-encoded text bytes (no separate
-//   decode pass), and writes answers.json bytes to OUT_BASE. JS copies the
-//   output buffer out with writeFileSync. No JSON.parse / JSON.stringify.
-// - Why encoded works: in the JSON-encoded text, every CSV special character
-//   appears as an escape sequence: `"` -> `\"`, LF -> `\n`, CR -> `\r`,
-//   TAB -> `\t`, backslash -> `\\`. A bare `"` / LF / CR byte NEVER appears
-//   inside a JSON string. And the JSON encoding of a field value is exactly
-//   the JSON encoding the output needs, so clean fields are copied verbatim
-//   (no decode, no re-escape). Only the CSV transformations ("" -> ",
-//   CR/CRLF inside quotes -> LF, stray CR dropped) need rewriting.
-// - CSV semantics mirror csv-reader 1.0.0 exactly (vendor/csv-reader/index.js
-//   and the proven v1 solve.js). The engine works on the encoded bytes, where
-//   a "CSV character" is either one byte (`,` and any byte except `\` and `"`)
-//   or an escape sequence (`\` + 1 char, or `\uXXXX` = 6 bytes, opaque).
-// - `\uXXXX` escapes: JSON.stringify never emits them for this data (verified:
-//   practice cases.json has 0 `\u` and 0 `\\`). They are treated as opaque
-//   6-byte sequences and copied verbatim (correct JSON for that code unit).
-//   A `\u` decoding to a CSV special (", ,, LF, CR) cannot occur from
-//   JSON.stringify output; it is not handled (documented limitation).
-// - Determinism: single-threaded, no hashing, no randomness; output is a pure
-//   function of the input bytes.
+// v6 keeps v4's in-memory single-pass engine (NO streaming pump, NO
+// header pre-scan — v5 proved streaming costs more than it saves: the
+// header-after-text pre-scan alone is +8 ms, and the pump loop + window
+// management cost more than the SIMD saved). What v6 adds over v4 is
+// ONE thing: a record-level clean-line fast path that extracts ALL comma
+// positions from a 32-byte SIMD bitmask with @ctz and emits the fields
+// without per-field function calls or per-character branches. The shared
+// scanners (findBs / findCommaOrBs / parseJsonString) stay at v4's
+// 32-byte windows — v4 already proved 64-byte windows are SLOWER under
+// Liftoff (13.13 ms vs 12.04 ms warm run_json; the smaller unrolled code
+// is friendlier to the I-cache), and v6's first build confirmed it again
+// (64-byte + fast path: 17.80 ms warm run_json vs v4's 12.07 ms).
+//
+// The fast path only fires on clean records (no '"' anywhere, no '\'
+// except the terminating line-break escape). A record whose first field
+// is quoted bails on two byte reads, so the ~81% quoted-field records
+// pay almost nothing for the attempt.
+//
+// CSV semantics mirror csv-reader 1.0.0 exactly (vendor/csv-reader/index.js
+// and the proven v1 solve.js). The engine works on the JSON-encoded text
+// bytes (encoded-text approach, as in v2): a "CSV character" is either one
+// byte (',' and any byte except '\' and '"') or an escape sequence ('\'
+// + 1 char, or '\uXXXX' = 6 bytes, opaque). '\uXXXX' escapes are copied
+// verbatim as opaque 6-byte sequences (practice cases.json has 0 '\u' and
+// 0 '\\'; a '\u' decoding to a CSV special cannot occur from
+// JSON.stringify output).
+//
+// Error order matches the vendor exactly: field errors (stray_cr,
+// quote_junk, unterminated_quote) are recorded in scan order while the
+// record is parsed; short_row / long_row are recorded when the record ends
+// (after all of its field errors). A long row's extra field VALUES are
+// therefore buffered in a small scratch area (XB + XSPAN) until the record
+// ends, so the long_row error (with its "extra" array) is emitted after
+// any stray_cr/quote_junk inside the extra fields. A dropped record
+// (exactly one empty unquoted field) gets no short_row/long_row error, and
+// its output bytes are rewound.
+//
+// Determinism: single-threaded, no hashing, no randomness; output is a
+// pure function of the input bytes.
 
 const std = @import("std");
 
-// ---------------- memory layout (initial 1024 pages = 64 MiB) ----------------
-// input buffer: 0 .. (written by JS)
+// ---------------- memory layout (initial 544 pages = 34 MiB) ----------------
+// input buffer: IN_BASE .. (written by JS, read-only for us)
 // output buffer: OUT_BASE .. (answers.json, ~12 MiB)
-// scratch: SCRATCH_BASE .. (errors buffer, field buffer, record spans)
-const OUT_BASE: u32 = 0x2000000; // 32 MiB
-const SCRATCH_BASE: u32 = 0x3000000; // 48 MiB
+// scratch: SCRATCH_BASE .. (errors buffer, extra-field buffer, extra spans)
+// Layout is packed tight to minimise the init() memory-grow cost (growing
+// zeroes the new pages) and gVisor page faults: input 2 MiB (above the
+// ~1 MiB data segment), output 15 MiB (input is <= ~13 MiB, so the gap is
+// ~1 MiB, not v3's 7 MiB), scratch 30 MiB (output <= ~15 MiB, gap ~2 MiB).
+// Total 34 MiB (544 pages) vs v3's 40 MiB (640 pages). Bounds (safe for
+// the generator's data: input <= ~12 MiB, output <= ~13 MiB):
+// input [2, 15), output [15, 30), scratch [30, 34).
+const IN_BASE: u32 = 0x200000; // 2 MiB (input; JS writes here)
+const OUT_BASE: u32 = 0xF00000; // 15 MiB
+const SCRATCH_BASE: u32 = 0x1E00000; // 30 MiB
 const ERR_BASE: u32 = SCRATCH_BASE; // errors JSON fragments, cap 1 MiB
 const ERR_CAP: u32 = 0x100000;
-const FB_BASE: u32 = SCRATCH_BASE + 0x100000; // materialized field values, 1 MiB
-const FB_CAP: u32 = 0x100000;
-const SPAN_BASE: u32 = SCRATCH_BASE + 0x200000; // record field spans (ptr,len) pairs
+const XB_BASE: u32 = SCRATCH_BASE + 0x100000; // extra field values (long rows), 1 MiB
+const XB_CAP: u32 = 0x100000;
+const XSPAN_BASE: u32 = SCRATCH_BASE + 0x200000; // extra field spans (ptr,len), 4096 x 8 B
+const XSPAN_CAP_FIELDS: u32 = 4096;
 const TEXT_BUF: u32 = SCRATCH_BASE + 0x201000; // scratch for materialized non-string text
-const SPAN_CAP_FIELDS: u32 = 128;
 
 // ---------------- globals ----------------
 var g_in_end: u32 = 0; // end of input (cases.json) in memory
 var g_out: u32 = 0; // current output write position
 var g_err_len: u32 = 0; // bytes used in errors buffer
-var g_fast_recs: u64 = 0;
-var g_slow_recs: u64 = 0;
-var g_fast_fields: u64 = 0;
-var g_slow_fields: u64 = 0;
-
-export fn stats() u64 { return (g_fast_recs << 48) | (g_slow_recs << 32) | (g_fast_fields << 16) | g_slow_fields; }
-var g_fb: u32 = 0; // field buffer write position (reset per record)
 
 // CSV per-case state
 var cs_start: u32 = 0; // text span start (encoded)
@@ -64,14 +81,26 @@ var cs_rows: u32 = 0; // rows emitted so far (for row index)
 var cs_cols_done: bool = false; // first record (columns) already handled
 var cs_rec_line: u32 = 1; // current record's start line
 var cs_rec_row: i32 = -1; // current record's row index (-1 = null/header)
-var g_nspans: u32 = 0; // fields in current record
-var g_last_quoted: bool = false; // last field of current record opened with a quote
+
+// CSV per-record state (single-pass)
+var g_rec_start: u32 = 0; // g_out at record start (rewind point if dropped)
+var g_field_count: u32 = 0; // fields in current record
+var g_field1_len: u32 = 0; // content bytes of field 1
+var g_field1_quoted: bool = false; // field 1 opened with a quote
+var g_fld_quoted: bool = false; // current field opened with a quote
+var g_is_long: bool = false; // record exceeded width (has extra fields)
+var g_xb: u32 = XB_BASE; // extra buffer write position (reset per record)
+var g_nxspan: u32 = 0; // extra spans in current record
 
 // Field end kinds
 const F_COMMA: u8 = 0;
 const F_BREAK: u8 = 1;
 const F_END: u8 = 2;
-const F_JUNK: u8 = 3;
+
+// Record results
+const REC_END: u8 = 0; // no more records
+const REC_KEPT: u8 = 1; // record emitted
+const REC_DROPPED: u8 = 2; // record dropped (rewound)
 
 // ---------------- low-level memory access ----------------
 inline fn b8(p: u32) u8 {
@@ -83,12 +112,6 @@ inline fn b8set(p: u32, v: u8) void {
 inline fn load16(p: u32) @Vector(16, u8) {
     return @as(*const [16]u8, @ptrFromInt(p)).*;
 }
-fn store16(p: u32, v: @Vector(16, u8)) void {
-    @as(*[16]u8, @ptrFromInt(p)).* = v;
-}
-inline fn loadU16(p: u32) u16 {
-    return @as(*const u16, @ptrFromInt(p)).*;
-}
 inline fn loadU32(p: u32) u32 {
     return @as(*const u32, @ptrFromInt(p)).*;
 }
@@ -96,84 +119,69 @@ inline fn storeU32(p: u32, v: u32) void {
     @as(*u32, @ptrFromInt(p)).* = v;
 }
 
-// memcpy within linear memory (handles overlap like memmove via std)
+// memcpy within linear memory.
 fn memCopy(dst: u32, src: u32, len: u32) void {
     if (len == 0) return;
     const d: [*]u8 = @ptrFromInt(dst);
     const s: [*]const u8 = @ptrFromInt(src);
     @memcpy(d[0..len], s[0..len]);
 }
-fn memEqual(a: u32, b: u32, len: u32) bool {
-    if (len == 0) return true;
-    const x: [*]const u8 = @ptrFromInt(a);
-    const y: [*]const u8 = @ptrFromInt(b);
-    return std.mem.eql(u8, x[0..len], y[0..len]);
-}
 
 // ---------------- output helpers ----------------
-inline fn outByte(v: u8) void {
-    b8set(g_out, v);
-    g_out += 1;
+// All output helpers take an explicit *u32 destination pointer so the
+// per-record hot path (parseEmitRecord) can thread a LOCAL output
+// position (a register / stack slot) instead of touching the g_out
+// global on every structural byte. The field readers already take a
+// *u32 dst; these helpers now match. Callers pass &g_out (processCase,
+// run_json -- per-case/per-run, negligible) or a local (parseEmitRecord).
+inline fn outByte(dst: *u32, v: u8) void {
+    b8set(dst.*, v);
+    dst.* += 1;
 }
-fn outSlice(p: u32, len: u32) void {
-    memCopy(g_out, p, len);
-    g_out += len;
+fn outSlice(dst: *u32, p: u32, len: u32) void {
+    memCopy(dst.*, p, len);
+    dst.* += len;
 }
-fn outLit(s: []const u8) void {
-    for (s) |c| outByte(c);
+fn outLit(dst: *u32, s: []const u8) void {
+    for (s) |c| outByte(dst, c);
 }
-fn outU32(n: u32) void {
+fn outU32(dst: *u32, n: u32) void {
     var buf: [10]u8 = undefined;
     var v = n;
     var i: usize = 10;
     if (v == 0) {
-        outByte('0');
+        outByte(dst, '0');
         return;
     }
     while (v > 0) : (v /= 10) {
         i -= 1;
         buf[i] = @intCast('0' + (v % 10));
     }
-    for (buf[i..10]) |c| outByte(c);
-}
-fn outI32(n: i32) void {
-    if (n < 0) {
-        outByte('-');
-        outU32(@intCast(-n));
-    } else {
-        outU32(@intCast(n));
-    }
+    for (buf[i..10]) |c| outByte(dst, c);
 }
 
-// ---------------- SIMD scanning ----------------
-// Find the next position >= pos where the byte is ',' or '\\', up to end.
-// Returns end if none. (Used by the unquoted-field scan: ',' ends the field,
-// '\\' starts an escape that must be classified.)
-fn findCommaOrBs(pos: u32, end: u32) u32 {
-    var p = pos;
-    const comma_splat: @Vector(16, u8) = @splat(',');
-    const bs_splat: @Vector(16, u8) = @splat('\\');
-    while (p + 16 <= end) : (p += 16) {
-        const chunk = load16(p);
-        const m: u16 = @bitCast((chunk == comma_splat) | (chunk == bs_splat));
-        if (m != 0) return p + @ctz(m);
-    }
-    while (p < end) : (p += 1) {
-        const c = b8(p);
-        if (c == ',' or c == '\\') return p;
-    }
-    return end;
-}
-
+// ---------------- SIMD scanning (32-byte windows) ----------------
 // Find the next position >= pos where the byte is '\\', up to end.
-// Returns end if none. (Used by the quoted-field scan and the JSON string scan.)
-fn findBs(pos: u32, end: u32) u32 {
+// Returns end if none. 32-byte windows (v4's proven-faster choice:
+// 64-byte windows measured 13.13 ms vs 32-byte 12.04 ms warm run_json —
+// the smaller unrolled code is friendlier to the Liftoff I-cache).
+inline fn findBs(pos: u32, end: u32) u32 {
     var p = pos;
-    const bs_splat: @Vector(16, u8) = @splat('\\');
+    const splat: @Vector(16, u8) = @splat('\\');
+    while (p + 32 <= end) {
+        var m: u32 = 0;
+        inline for (0..2) |i| {
+            const chunk = load16(p + @as(u32, @intCast(i * 16)));
+            const b: u16 = @bitCast(chunk == splat);
+            m |= @as(u32, b) << @as(u5, @intCast(i * 16));
+        }
+        if (m != 0) return p + @ctz(m);
+        p += 32;
+    }
     while (p + 16 <= end) : (p += 16) {
         const chunk = load16(p);
-        const m: u16 = @bitCast(chunk == bs_splat);
-        if (m != 0) return p + @ctz(m);
+        const mm: u16 = @bitCast(chunk == splat);
+        if (mm != 0) return p + @ctz(mm);
     }
     while (p < end) : (p += 1) {
         if (b8(p) == '\\') return p;
@@ -181,79 +189,34 @@ fn findBs(pos: u32, end: u32) u32 {
     return end;
 }
 
-// Find the next position >= pos where the byte is '"' or '\\', up to end.
-// Returns end if none. (Used to find a JSON string's closing quote: a '"'
-// preceded by an odd run of backslashes is escaped.)
-fn findQuoteOrBs(pos: u32, end: u32) u32 {
+// Find the next position >= pos where the byte is ',' or '\\', up to end.
+// Returns end if none. (Unquoted-field scan: ',' ends the field, '\\'
+// starts an escape that must be classified.) 32-byte windows (v4's
+// proven-faster choice; see findBs).
+inline fn findCommaOrBs(pos: u32, end: u32) u32 {
     var p = pos;
-    const q_splat: @Vector(16, u8) = @splat('"');
-    const bs_splat: @Vector(16, u8) = @splat('\\');
+    const c_splat: @Vector(16, u8) = @splat(',');
+    const b_splat: @Vector(16, u8) = @splat('\\');
+    while (p + 32 <= end) {
+        var m: u32 = 0;
+        inline for (0..2) |i| {
+            const chunk = load16(p + @as(u32, @intCast(i * 16)));
+            const b: u16 = @bitCast((chunk == c_splat) | (chunk == b_splat));
+            m |= @as(u32, b) << @as(u5, @intCast(i * 16));
+        }
+        if (m != 0) return p + @ctz(m);
+        p += 32;
+    }
     while (p + 16 <= end) : (p += 16) {
         const chunk = load16(p);
-        const m: u16 = @bitCast((chunk == q_splat) | (chunk == bs_splat));
-        if (m != 0) return p + @ctz(m);
+        const mm: u16 = @bitCast((chunk == c_splat) | (chunk == b_splat));
+        if (mm != 0) return p + @ctz(mm);
     }
     while (p < end) : (p += 1) {
         const c = b8(p);
-        if (c == '"' or c == '\\') return p;
+        if (c == ',' or c == '\\') return p;
     }
     return end;
-}
-
-// Count line breaks in the encoded span [start, end): each `\n` escape and
-// each `\r` escape counts 1, except a `\r` escape immediately followed by a
-// `\n` escape (CRLF) counts as 1 for the pair. `prev_cr` carries whether the
-// byte before `start` was a `\r` escape's end... simpler: this counts breaks
-// for a span that starts and ends on escape boundaries (quoted content).
-// It scans for backslashes and classifies each escape.
-fn countLineBreaks(start: u32, end: u32) u32 {
-    var n: u32 = 0;
-    var p = start;
-    while (p < end) {
-        const m = findBs(p, end);
-        if (m >= end) break;
-        // escape at m: next byte decides
-        if (m + 1 >= end) break; // trailing lone backslash (cannot happen in valid JSON)
-        const c = b8(m + 1);
-        if (c == 'n') {
-            n += 1;
-            p = m + 2;
-        } else if (c == 'r') {
-            // CRLF pair counts once: if the next escape is \n, skip it too
-            if (m + 4 <= end and b8(m + 2) == '\\' and b8(m + 3) == 'n') {
-                n += 1;
-                p = m + 4;
-            } else {
-                n += 1;
-                p = m + 2;
-            }
-        } else if (c == 'u') {
-            p = m + 6;
-        } else {
-            p = m + 2;
-        }
-    }
-    return n;
-}
-
-// Does the encoded span [start, end) contain a `\"` escape (a quote char) or
-// a `\r` escape? Used to decide whether a quoted field's content can be
-// copied verbatim (no "" doubling, no CR to normalize).
-fn spanHasQuoteOrCr(start: u32, end: u32) bool {
-    var p = start;
-    while (p < end) {
-        const m = findBs(p, end);
-        if (m >= end) return false;
-        if (m + 1 >= end) return false;
-        const c = b8(m + 1);
-        if (c == '"' or c == 'r') return true;
-        if (c == 'u') {
-            p = m + 6;
-        } else {
-            p = m + 2;
-        }
-    }
-    return false;
 }
 
 // ---------------- JSON parsing (structure only; text stays encoded) ----------------
@@ -279,30 +242,62 @@ fn keyIs(start: u32, len: u32, want: []const u8) bool {
 
 // Parse a JSON string starting at p (which points at the opening '"').
 // Returns the raw (still escaped) content span and the position after the
-// closing quote. Escapes are skipped as units, so a '"' returned is always
-// the closing quote.
+// closing quote. The closing quote is found with 32-byte SIMD windows: a
+// '"' is the closing quote iff the byte before it is not a backslash.
+// (Assumes no '\\' escapes; see the header note.) This is a fixed-cost
+// scan per 32 bytes, not one findQuoteOrBs call per escape.
+// 32-byte windows (v4's proven-faster choice; see findBs).
 const StrSpan = struct { start: u32, end: u32, next: u32 };
 fn parseJsonString(p: u32) StrSpan {
-    var q = p + 1;
-    const start = q;
-    while (true) {
-        const m = findQuoteOrBs(q, g_in_end);
-        if (m >= g_in_end) {
-            return .{ .start = start, .end = g_in_end, .next = g_in_end };
-        }
-        const c = b8(m);
-        if (c == '\\') {
-            if (m + 1 < g_in_end and b8(m + 1) == 'u') {
-                q = m + 6;
-            } else {
-                q = m + 2;
+    const start = p + 1;
+    var q = start;
+    var prev_bs = false; // the byte just before q is a backslash
+    const q_splat: @Vector(16, u8) = @splat('"');
+    const b_splat: @Vector(16, u8) = @splat('\\');
+    while (q < g_in_end) {
+        if (q + 32 <= g_in_end) {
+            var mq: u32 = 0;
+            var mb: u32 = 0;
+            inline for (0..2) |i| {
+                const chunk = load16(q + @as(u32, @intCast(i * 16)));
+                const qq: u16 = @bitCast(chunk == q_splat);
+                const bb: u16 = @bitCast(chunk == b_splat);
+                mq |= @as(u32, qq) << @as(u5, @intCast(i * 16));
+                mb |= @as(u32, bb) << @as(u5, @intCast(i * 16));
             }
+            // A '"' at bit j is escaped iff the byte at j-1 is '\'.
+            var unesc = mq & ~(mb << 1);
+            if (prev_bs) unesc &= ~@as(u32, 1);
+            if (unesc != 0) {
+                const m = q + @as(u32, @intCast(@ctz(unesc)));
+                return .{ .start = start, .end = m, .next = m + 1 };
+            }
+            prev_bs = (mb >> 31) & 1 != 0;
+            q += 32;
             continue;
         }
-        // c == '"': the closing quote (any escaped quote's backslash was
-        // found first by findQuoteOrBs and skipped above).
-        return .{ .start = start, .end = m, .next = m + 1 };
+        if (q + 16 <= g_in_end) {
+            const chunk = load16(q);
+            const mq: u16 = @bitCast(chunk == q_splat);
+            const mb: u16 = @bitCast(chunk == b_splat);
+            var unesc = mq & ~(mb << 1);
+            if (prev_bs) unesc &= ~@as(u16, 1);
+            if (unesc != 0) {
+                const m = q + @as(u32, @intCast(@ctz(unesc)));
+                return .{ .start = start, .end = m, .next = m + 1 };
+            }
+            prev_bs = (mb >> 15) & 1 != 0;
+            q += 16;
+            continue;
+        }
+        const c = b8(q);
+        if (c == '"' and !prev_bs) {
+            return .{ .start = start, .end = q, .next = q + 1 };
+        }
+        prev_bs = (c == '\\');
+        q += 1;
     }
+    return .{ .start = start, .end = g_in_end, .next = g_in_end };
 }
 
 // Skip one JSON value starting at p (after skipWs). Returns the position
@@ -354,7 +349,6 @@ fn skipJsonValue(p: u32) u32 {
     }
     return q;
 }
-
 
 // Materialize a non-string JSON value (null/true/false/number) starting at p
 // into TEXT_BUF as its String() form (the raw token, which equals String(v)
@@ -532,191 +526,142 @@ fn errShortRow() void {
     errLit(",\"row\":");
     errRow();
     errLit(",\"fields\":");
-    errU32(g_nspans);
+    errU32(g_field_count);
     errByte('}');
 }
 fn errLongRow() void {
-    const w: u32 = @intCast(cs_width);
     errSep();
     errLit("{\"code\":\"long_row\",\"line\":");
     errU32(cs_rec_line);
     errLit(",\"row\":");
     errRow();
     errLit(",\"extra\":[");
-    var i = w;
-    while (i < g_nspans) : (i += 1) {
-        if (i > w) errByte(',');
+    var i: u32 = 0;
+    while (i < g_nxspan) : (i += 1) {
+        if (i > 0) errByte(',');
         errByte('"');
-        errSlice(getSpanPtr(i), getSpanLen(i));
+        errSlice(getXSpanPtr(i), getXSpanLen(i));
         errByte('"');
     }
     errLit("]}");
 }
 
-// ---------------- record field spans ----------------
-fn addSpan(ptr: u32, len: u32) void {
-    const base = SPAN_BASE + g_nspans * 8;
+// ---------------- extra-field spans (long rows) ----------------
+fn addXSpan(ptr: u32, len: u32) void {
+    const base = XSPAN_BASE + g_nxspan * 8;
     storeU32(base, ptr);
     storeU32(base + 4, len);
-    g_nspans += 1;
+    g_nxspan += 1;
 }
-fn getSpanPtr(i: u32) u32 {
-    return loadU32(SPAN_BASE + i * 8);
+fn getXSpanPtr(i: u32) u32 {
+    return loadU32(XSPAN_BASE + i * 8);
 }
-fn getSpanLen(i: u32) u32 {
-    return loadU32(SPAN_BASE + i * 8 + 4);
+fn getXSpanLen(i: u32) u32 {
+    return loadU32(XSPAN_BASE + i * 8 + 4);
 }
 
-// ---------------- field readers (slow path) ----------------
-// All slow-path field values are materialized into the field buffer as
-// JSON-escaped bytes (escapes copied verbatim, stray CRs dropped, "" -> ",
-// CR/CRLF inside quotes -> \n). Spans then point into the field buffer.
+// ---------------- field readers (single-pass, direct-emitting) ----------------
+// A field's JSON-escaped content is appended to *dst (advancing it).
+// The caller wraps it in '"' quotes and computes the content length as
+// (dst_after - dst_before). Returns F_COMMA, F_BREAK, or F_END.
 
-// Read an unquoted field, appending its value to the field buffer starting
-// at fb_start, and record a span for it. Returns the end kind. Sets
-// g_last_added to the bytes appended by this call.
-var g_last_added: u32 = 0;
-fn readUnquotedAppend(fb_start: u32) u8 {
-    const fb_before = g_fb;
-    var seg = cs_pos;
+// Read an unquoted field, appending its content to *dst.
+inline fn readUnquotedTo(dst: *u32) u8 {
     var p = cs_pos;
+    var seg = p;
     while (true) {
         const m = findCommaOrBs(p, cs_end);
         if (m >= cs_end) {
-            memCopy(g_fb, seg, cs_end - seg);
-            g_fb += cs_end - seg;
-            addSpan(fb_start, g_fb - fb_start);
-            g_last_added = g_fb - fb_before;
+            const n = cs_end - seg;
+            memCopy(dst.*, seg, n);
+            dst.* += n;
             cs_pos = cs_end;
             return F_END;
         }
         if (b8(m) == ',') {
-            memCopy(g_fb, seg, m - seg);
-            g_fb += m - seg;
-            addSpan(fb_start, g_fb - fb_start);
-            g_last_added = g_fb - fb_before;
+            const n = m - seg;
+            memCopy(dst.*, seg, n);
+            dst.* += n;
             cs_pos = m + 1;
             return F_COMMA;
         }
         // escape at m
         if (m + 1 >= cs_end) {
-            // trailing lone backslash (invalid JSON; treat as end)
-            memCopy(g_fb, seg, cs_end - seg);
-            g_fb += cs_end - seg;
-            addSpan(fb_start, g_fb - fb_start);
-            g_last_added = g_fb - fb_before;
+            const n = cs_end - seg;
+            memCopy(dst.*, seg, n);
+            dst.* += n;
             cs_pos = cs_end;
             return F_END;
         }
         const e = b8(m + 1);
         if (e == 'n') {
-            memCopy(g_fb, seg, m - seg);
-            g_fb += m - seg;
-            addSpan(fb_start, g_fb - fb_start);
-            g_last_added = g_fb - fb_before;
+            const n = m - seg;
+            memCopy(dst.*, seg, n);
+            dst.* += n;
             cs_pos = m + 2;
             cs_line += 1;
             return F_BREAK;
         }
         if (e == 'r') {
             if (m + 4 <= cs_end and b8(m + 2) == '\\' and b8(m + 3) == 'n') {
-                memCopy(g_fb, seg, m - seg);
-                g_fb += m - seg;
-                addSpan(fb_start, g_fb - fb_start);
-                g_last_added = g_fb - fb_before;
+                const n = m - seg;
+                memCopy(dst.*, seg, n);
+                dst.* += n;
                 cs_pos = m + 4;
                 cs_line += 1;
                 return F_BREAK;
             }
             // stray CR: error, drop it, continue
             errSimple("stray_cr");
-            memCopy(g_fb, seg, m - seg);
-            g_fb += m - seg;
+            const n = m - seg;
+            memCopy(dst.*, seg, n);
+            dst.* += n;
             seg = m + 2;
             p = m + 2;
             continue;
         }
-        // other escape (", t, b, f, \, /, u...): a literal char, keep scanning
-        p = if (e == 'u') m + 6 else m + 2;
-    }
-}
-// Standalone unquoted field: use a direct span into the text when no stray
-// CR needs dropping (the common case). Falls back to FB materialization
-// only when a stray CR is present.
-fn readUnquoted() u8 {
-    var p = cs_pos;
-    const seg_start = cs_pos;
-    while (true) {
-        const m = findCommaOrBs(p, cs_end);
-        if (m >= cs_end) {
-            addSpan(seg_start, cs_end - seg_start);
-            cs_pos = cs_end;
-            return F_END;
-        }
-        if (b8(m) == ',') {
-            addSpan(seg_start, m - seg_start);
-            cs_pos = m + 1;
-            return F_COMMA;
-        }
-        if (m + 1 >= cs_end) {
-            addSpan(seg_start, cs_end - seg_start);
-            cs_pos = cs_end;
-            return F_END;
-        }
-        const e = b8(m + 1);
-        if (e == 'n') {
-            addSpan(seg_start, m - seg_start);
-            cs_pos = m + 2;
-            cs_line += 1;
-            return F_BREAK;
-        }
-        if (e == 'r') {
-            if (m + 4 <= cs_end and b8(m + 2) == '\\' and b8(m + 3) == 'n') {
-                addSpan(seg_start, m - seg_start);
-                cs_pos = m + 4;
-                cs_line += 1;
-                return F_BREAK;
-            }
-            // stray CR: materialize into FB (drops the CR), re-scan from seg_start
-            cs_pos = seg_start;
-            return readUnquotedAppend(g_fb);
-        }
-        p = if (e == 'u') m + 6 else m + 2;
+        // other escape (", t, b, f, \, /, u...): a literal char, copy
+        // through it verbatim and keep scanning
+        const elen: u32 = if (e == 'u') 6 else 2;
+        const n = m + elen - seg;
+        memCopy(dst.*, seg, n);
+        dst.* += n;
+        seg = m + elen;
+        p = m + elen;
     }
 }
 
-// Copy a quoted field's content span [cstart, cend) into the field buffer,
-// applying the CSV transforms: \"\" -> \" (one quote), \r\n -> \n, \r -> \n.
-// Other escapes are copied verbatim. Returns nothing; g_fb advances.
-fn copyQuotedContent(cstart: u32, cend: u32) void {
+// Copy a quoted field's content span [cstart, cend) to *dst, applying the
+// CSV transforms: "" -> " (one quote), \r\n -> \n, \r -> \n.
+// Other escapes are copied verbatim.
+inline fn copyQuotedContentTo(cstart: u32, cend: u32, dst: *u32) void {
     var q = cstart;
     while (q < cend) {
         const m = findBs(q, cend);
         if (m >= cend) {
-            memCopy(g_fb, q, cend - q);
-            g_fb += cend - q;
+            const n = cend - q;
+            memCopy(dst.*, q, n);
+            dst.* += n;
             return;
         }
-        memCopy(g_fb, q, m - q);
-        g_fb += m - q;
-        if (m + 1 >= cend) {
-            // trailing backslash (cannot happen inside a closed quoted field)
-            return;
-        }
+        const n = m - q;
+        memCopy(dst.*, q, n);
+        dst.* += n;
+        if (m + 1 >= cend) return;
         const e = b8(m + 1);
         if (e == '"') {
-            // doubled quote \"\" -> emit one \"
-            b8set(g_fb, '\\');
-            g_fb += 1;
-            b8set(g_fb, '"');
-            g_fb += 1;
+            // doubled quote "" -> emit one \"
+            b8set(dst.*, '\\');
+            dst.* += 1;
+            b8set(dst.*, '"');
+            dst.* += 1;
             q = m + 4;
         } else if (e == 'r') {
             // CR (lone or CRLF) -> \n
-            b8set(g_fb, '\\');
-            g_fb += 1;
-            b8set(g_fb, 'n');
-            g_fb += 1;
+            b8set(dst.*, '\\');
+            dst.* += 1;
+            b8set(dst.*, 'n');
+            dst.* += 1;
             if (m + 4 <= cend and b8(m + 2) == '\\' and b8(m + 3) == 'n') {
                 q = m + 4;
             } else {
@@ -724,16 +669,16 @@ fn copyQuotedContent(cstart: u32, cend: u32) void {
             }
         } else {
             const elen: u32 = if (e == 'u') 6 else 2;
-            memCopy(g_fb, m, elen);
-            g_fb += elen;
+            memCopy(dst.*, m, elen);
+            dst.* += elen;
             q = m + elen;
         }
     }
 }
 
-// Read a quoted field whose opening \" is at cs_pos. Materializes the value
-// into the field buffer and records a span. Returns the end kind.
-fn readQuoted() u8 {
+// Read a quoted field whose opening \" is at cs_pos. Emits the content to
+// *dst. Returns F_COMMA, F_BREAK, or F_END.
+inline fn readQuotedTo(dst: *u32) u8 {
     const open = cs_pos;
     const open_line = cs_line;
     var p = open + 2; // content starts after the opening \"
@@ -781,87 +726,63 @@ fn readQuoted() u8 {
         cs_pos = open + 2;
         cs_line = open_line;
         errSimple("unterminated_quote");
-        const fb_start = g_fb;
-        b8set(g_fb, '\\');
-        g_fb += 1;
-        b8set(g_fb, '"');
-        g_fb += 1;
-        return readUnquotedAppend(fb_start);
+        b8set(dst.*, '\\');
+        dst.* += 1;
+        b8set(dst.*, '"');
+        dst.* += 1;
+        return readUnquotedTo(dst);
     }
     const cstart = open + 2;
     const cend = close;
-    // line breaks inside the quoted content (counted inline during the scan)
     cs_line += breaks;
-    // what follows the closing quote (which ends at close+2)
     cs_pos = close + 2;
-    const clean_end: u8 = blk: {
-        if (cs_pos >= cs_end) break :blk F_END;
-        const c = b8(cs_pos);
-        if (c == ',') break :blk F_COMMA;
-        if (c == '\\' and cs_pos + 1 < cs_end) {
-            const e = b8(cs_pos + 1);
-            if (e == 'n') break :blk F_BREAK;
-            if (e == 'r' and cs_pos + 4 <= cs_end and b8(cs_pos + 2) == '\\' and b8(cs_pos + 3) == 'n') break :blk F_BREAK;
-        }
-        break :blk F_JUNK;
-    };
-    if (clean_end != F_JUNK and !has_dbl and !has_cr) {
-        // direct span into the text (no FB copy, no transform needed)
-        addSpan(cstart, cend - cstart);
-        if (clean_end == F_END) return F_END;
-        if (clean_end == F_COMMA) { cs_pos += 1; return F_COMMA; }
-        // F_BREAK
-        if (b8(cs_pos + 1) == 'n') { cs_pos += 2; } else { cs_pos += 4; }
-        cs_line += 1;
-        return F_BREAK;
-    }
-    // materialize the content (transforms if needed)
-    const fb_start = g_fb;
     if (!has_dbl and !has_cr) {
-        memCopy(g_fb, cstart, cend - cstart);
-        g_fb += cend - cstart;
+        // clean: memcpy the whole content in one op
+        const n = cend - cstart;
+        memCopy(dst.*, cstart, n);
+        dst.* += n;
     } else {
-        copyQuotedContent(cstart, cend);
+        copyQuotedContentTo(cstart, cend, dst);
     }
-    if (cs_pos >= cs_end) {
-        addSpan(fb_start, g_fb - fb_start);
-        return F_END;
-    }
+    // what follows the closing quote
+    if (cs_pos >= cs_end) return F_END;
     const c = b8(cs_pos);
     if (c == ',') {
-        addSpan(fb_start, g_fb - fb_start);
         cs_pos += 1;
         return F_COMMA;
     }
-    if (c == '\\') {
-        if (cs_pos + 1 < cs_end) {
-            const e = b8(cs_pos + 1);
-            if (e == 'n') {
-                addSpan(fb_start, g_fb - fb_start);
-                cs_pos += 2;
-                cs_line += 1;
-                return F_BREAK;
-            }
-            if (e == 'r' and cs_pos + 4 <= cs_end and b8(cs_pos + 2) == '\\' and b8(cs_pos + 3) == 'n') {
-                addSpan(fb_start, g_fb - fb_start);
-                cs_pos += 4;
-                cs_line += 1;
-                return F_BREAK;
-            }
+    if (c == '\\' and cs_pos + 1 < cs_end) {
+        const e = b8(cs_pos + 1);
+        if (e == 'n') {
+            cs_pos += 2;
+            cs_line += 1;
+            return F_BREAK;
+        }
+        if (e == 'r' and cs_pos + 4 <= cs_end and b8(cs_pos + 2) == '\\' and b8(cs_pos + 3) == 'n') {
+            cs_pos += 4;
+            cs_line += 1;
+            return F_BREAK;
         }
     }
     // junk after the closing quote: read as unquoted, appended to the value
-    const fb_before_junk = g_fb;
-    const kind = readUnquotedAppend(fb_start);
-    if (g_fb - fb_before_junk > 0) {
-        // junk.added > 0 (bytes appended by the junk scan; a junk of only
-        // dropped stray CRs appends 0 bytes, matching added == 0)
+    const dst_before_junk = dst.*;
+    const kind = readUnquotedTo(dst);
+    if (dst.* - dst_before_junk > 0) {
         errSimple("quote_junk");
     }
     return kind;
 }
 
-// ---------------- record parsing ----------------
+// Read one field starting at cs_pos, emitting its content to *dst.
+// Sets g_fld_quoted. Returns F_COMMA, F_BREAK, or F_END.
+inline fn readField(dst: *u32) u8 {
+    const quoted = cs_pos < cs_end and b8(cs_pos) == '\\' and cs_pos + 1 < cs_end and b8(cs_pos + 1) == '"';
+    g_fld_quoted = quoted;
+    if (quoted) return readQuotedTo(dst);
+    return readUnquotedTo(dst);
+}
+
+// ---------------- record parsing (single-pass, direct-emitting) ----------------
 fn skipEmptyLines() void {
     while (cs_pos < cs_end) {
         const c = b8(cs_pos);
@@ -875,144 +796,257 @@ fn skipEmptyLines() void {
     }
 }
 
-// Fast path: the record starting at cs_pos is one clean line (no quotes, no
-// stray CR). Parses it by splitting on commas, fills the spans, and returns
-// true. Returns false if the line is not clean (caller falls back to the
-// slow field-by-field path). Does not move cs_pos on false.
-fn tryFastRecord() bool {
+// ---------------- clean-line multi-comma @ctz fast path ----------------
+// Max fields a fast-path record may hold (safety bound; the slow path
+// handles larger records). The practice set peaks at ~12 fields/row.
+const MAX_FAST_FIELDS: u32 = 1024;
+
+// Attempt the clean-line fast path for the record starting at cs_pos.
+// A clean record has NO '"' anywhere and NO '\' except the terminating
+// line-break escape (\n, or \r\n): every field is plain unquoted text,
+// so the whole record can be emitted from ONE 64-byte SIMD scan that
+// yields every comma position (extracted with @ctz), with no per-field
+// function calls and no per-character branches.
+//
+// Correctness note: the scan always stops at the FIRST '"' or '\' in
+// the record (ctz of the combined mask). A '\n' inside a quoted field
+// can never be mistaken for a line break, because the field's opening
+// '"' precedes it and bails to the slow path first. A '\' is treated as
+// a line break only when no '"' precedes it and it is followed by 'n'
+// (or by 'r' + '\n' for CRLF); any other escape bails to the slow path.
+// Returning null is side-effect free (the scan only reads memory), so
+// the slow path can run cleanly afterwards.
+// The long_row "extra" values are recorded as spans straight into the
+// input (they are clean, so the raw bytes ARE the JSON string content);
+// the short_row/long_row handling and the drop check mirror
+// parseEmitRecord exactly.
+fn tryFastCleanRecord(emit_sep: bool) ?u8 {
+    // Fast bail: if the first field is quoted, the record is not clean.
+    // (A quoted field always opens with \" in the encoded text.) This
+    // makes the bail nearly free for the ~81% of records whose first
+    // field is quoted, instead of paying a full window scan to discover it.
+    if (cs_pos + 1 < cs_end and b8(cs_pos) == '\\' and b8(cs_pos + 1) == '"') return null;
+    // Phase 1: scan the record, collecting comma offsets (relative to cs_pos).
+    // 32-byte windows (same as the shared scanners: the smaller unrolled
+    // code is friendlier to the Liftoff I-cache).
+    var commas: [MAX_FAST_FIELDS]u32 = undefined;
+    var ncomma: u32 = 0;
     var p = cs_pos;
-    // comma positions within this line (max 64; more falls back to slow path)
-    var commas: [64]u32 = undefined;
-    var ncommas: u32 = 0;
-    var content_end: u32 = 0;
-    var after_pos: u32 = 0;
-    var is_last: bool = false; // line ends at cs_end (no terminator)
-    while (true) {
-        const m = findCommaOrBs(p, cs_end);
-        if (m >= cs_end) {
-            content_end = cs_end;
-            after_pos = cs_end;
-            is_last = true;
-            break;
+    var rec_end: u32 = cs_end;
+    var break_len: u32 = 0; // 2 for \n, 4 for \r\n, 0 for end-of-text
+    const c_splat: @Vector(16, u8) = @splat(',');
+    const b_splat: @Vector(16, u8) = @splat('\\');
+    const q_splat: @Vector(16, u8) = @splat('"');
+    while (p < cs_end) {
+        const wend = @min(p + 32, cs_end);
+        var mc: u32 = 0;
+        var mb: u32 = 0;
+        var mq: u32 = 0;
+        var n: u32 = 0;
+        while (n + 16 <= wend - p) {
+            const chunk = load16(p + n);
+            const cc: u16 = @bitCast(chunk == c_splat);
+            const bb: u16 = @bitCast(chunk == b_splat);
+            const qq: u16 = @bitCast(chunk == q_splat);
+            mc |= @as(u32, cc) << @as(u5, @intCast(n));
+            mb |= @as(u32, bb) << @as(u5, @intCast(n));
+            mq |= @as(u32, qq) << @as(u5, @intCast(n));
+            n += 16;
         }
-        const c = b8(m);
-        if (c == ',') {
-            if (ncommas >= 64) return false;
-            commas[ncommas] = m;
-            ncommas += 1;
-            p = m + 1;
-            continue;
+        while (n < wend - p) : (n += 1) {
+            const c = b8(p + n);
+            if (c == ',') mc |= @as(u32, 1) << @as(u5, @intCast(n));
+            if (c == '\\') mb |= @as(u32, 1) << @as(u5, @intCast(n));
+            if (c == '"') mq |= @as(u32, 1) << @as(u5, @intCast(n));
         }
-        // escape at m
-        if (m + 1 >= cs_end) {
-            // trailing backslash: treat line as ending at cs_end
-            content_end = cs_end;
-            after_pos = cs_end;
-            is_last = true;
-            break;
-        }
-        const e = b8(m + 1);
-        if (e == 'n') {
-            content_end = m;
-            after_pos = m + 2;
-            break;
-        }
-        if (e == 'r') {
-            if (m + 4 <= cs_end and b8(m + 2) == '\\' and b8(m + 3) == 'n') {
-                content_end = m;
-                after_pos = m + 4;
+        const bad = mb | mq;
+        if (bad != 0) {
+            const j = @ctz(bad);
+            const hit = p + @as(u32, @intCast(j));
+            // commas strictly before the hit
+            var m2 = mc & ((@as(u32, 1) << @as(u5, @intCast(j))) - 1);
+            while (m2 != 0) {
+                if (ncomma >= MAX_FAST_FIELDS) return null;
+                commas[ncomma] = (p - cs_pos) + @as(u32, @intCast(@ctz(m2)));
+                ncomma += 1;
+                m2 &= m2 - 1;
+            }
+            if (b8(hit) == '"') return null; // quoted field: slow path
+            // backslash: only a line-break escape keeps the record clean
+            if (hit + 1 >= cs_end) return null; // trailing backslash
+            const e = b8(hit + 1);
+            if (e == 'n') {
+                rec_end = hit;
+                break_len = 2;
                 break;
             }
-            return false; // stray CR
+            if (e == 'r' and hit + 4 <= cs_end and b8(hit + 2) == '\\' and b8(hit + 3) == 'n') {
+                rec_end = hit;
+                break_len = 4;
+                break;
+            }
+            return null; // stray CR or any other escape: slow path
         }
-        if (e == '"') return false; // quote
-        p = if (e == 'u') m + 6 else m + 2;
+        while (mc != 0) {
+            if (ncomma >= MAX_FAST_FIELDS) return null;
+            commas[ncomma] = (p - cs_pos) + @as(u32, @intCast(@ctz(mc)));
+            ncomma += 1;
+            mc &= mc - 1;
+        }
+        p = wend;
+        if (p >= cs_end) {
+            rec_end = cs_end;
+            break_len = 0;
+            break;
+        }
     }
-    // Clean line: fields are the comma-separated segments. They are already
-    // JSON-escaped (escapes copied verbatim), so spans point into the text.
-    g_nspans = 0;
-    g_fb = FB_BASE;
-    var fstart = cs_pos;
+    // Phase 2: emit the clean record.
+    const field_count = ncomma + 1;
+    // Drop check BEFORE any output: exactly one empty unquoted field.
+    // (Unreachable after skipEmptyLines except for a stray-CR-only line,
+    // which bails to the slow path above; kept for exact parity.)
+    if (field_count == 1 and rec_end == cs_pos) {
+        cs_pos = rec_end + break_len;
+        if (break_len > 0) cs_line += 1;
+        return REC_DROPPED;
+    }
+    var out: u32 = g_out;
+    g_rec_start = out;
+    g_field_count = field_count;
+    g_field1_len = 0;
+    g_field1_quoted = false;
+    g_is_long = false;
+    g_nxspan = 0;
+    g_xb = XB_BASE;
+    if (emit_sep) outByte(&out, ',');
+    outByte(&out, '[');
+    var fstart: u32 = 0; // field start, relative to cs_pos
     var i: u32 = 0;
-    while (i < ncommas) : (i += 1) {
-        addSpan(fstart, commas[i] - fstart);
-        fstart = commas[i] + 1;
+    while (i < field_count) : (i += 1) {
+        const fend: u32 = if (i < ncomma) commas[i] else rec_end - cs_pos;
+        const flen = fend - fstart;
+        if (cs_width >= 0 and i >= @as(u32, @intCast(cs_width))) {
+            // extra field (long row): record a span into the input; the
+            // long_row error is emitted below, after every field error
+            // (there are none in a clean record).
+            g_is_long = true;
+            addXSpan(cs_pos + fstart, flen);
+        } else {
+            if (i > 0) outByte(&out, ',');
+            outByte(&out, '"');
+            memCopy(out, cs_pos + fstart, flen);
+            out += flen;
+            outByte(&out, '"');
+        }
+        if (i == 0) g_field1_len = flen;
+        fstart = fend + 1; // skip the comma
     }
-    addSpan(fstart, content_end - fstart);
-    g_fast_recs += 1;
-    g_fast_fields += ncommas + 1;
-    g_last_quoted = false;
-    cs_pos = after_pos;
-    if (!is_last) cs_line += 1;
-    return true;
+    if (cs_width >= 0) {
+        const w: u32 = @intCast(cs_width);
+        if (field_count < w) {
+            errShortRow();
+            var j = field_count;
+            while (j < w) : (j += 1) {
+                outByte(&out, ',');
+                outLit(&out, "\"\"");
+            }
+        } else if (g_is_long) {
+            errLongRow();
+        }
+    }
+    outByte(&out, ']');
+    g_out = out;
+    cs_pos = rec_end + break_len;
+    if (break_len > 0) cs_line += 1;
+    return REC_KEPT;
 }
 
-// Slow path: parse one record field by field. Fills the spans.
-// Returns the end kind of the last field (F_BREAK / F_END).
-fn parseSlowRecord() u8 {
-    g_slow_recs += 1;
-    g_nspans = 0;
-    g_fb = FB_BASE;
+// Parse + emit one record starting at cs_pos, directly to the output.
+// emit_sep: emit a leading ',' before the row (rows after the first).
+// Returns REC_END (no more records), REC_KEPT, or REC_DROPPED.
+// On REC_DROPPED the output is rewound to the record's start (the row and
+// any separator vanish); the record's errors stay in the errors buffer.
+// The drop check runs BEFORE any short_row/long_row handling: a dropped
+// record gets no short_row/long_row error (vendor order).
+fn parseEmitRecord(emit_sep: bool) u8 {
+    skipEmptyLines();
+    if (cs_pos >= cs_end) return REC_END;
+    cs_rec_line = cs_line;
+    cs_rec_row = if (cs_header and !cs_cols_done) -1 else @intCast(cs_rows);
+    // Clean-line fast path first (side-effect free when it bails).
+    if (tryFastCleanRecord(emit_sep)) |res| return res;
+    // Local output position: threaded through the record so the hot path
+    // never touches the g_out global (register / stack slot instead).
+    // Synced back to g_out on the kept path; the drop path rewinds g_out
+    // directly to g_rec_start. The early REC_END return writes nothing,
+    // so it needs no sync.
+    var out: u32 = g_out;
+    g_rec_start = out;
+    if (emit_sep) outByte(&out, ',');
+    outByte(&out, '[');
+    g_field_count = 0;
+    g_field1_len = 0;
+    g_field1_quoted = false;
+    g_is_long = false;
+    g_nxspan = 0;
+    g_xb = XB_BASE;
     var kind: u8 = F_END;
     while (true) {
-        const quoted = cs_pos < cs_end and b8(cs_pos) == '\\' and cs_pos + 1 < cs_end and b8(cs_pos + 1) == '"';
-        g_last_quoted = quoted;
-        kind = if (quoted) readQuoted() else readUnquoted();
-        g_slow_fields += 1;
-        if (kind == F_COMMA) continue;
+        const is_extra = cs_width >= 0 and g_field_count >= @as(u32, @intCast(cs_width));
+        if (is_extra) g_is_long = true;
+        var content_len: u32 = 0;
+        if (is_extra) {
+            // extra field (long row): materialize into XB, record a span;
+            // the long_row error is emitted at record end, after every
+            // field error in the record (vendor order).
+            const xb_before = g_xb;
+            kind = readField(&g_xb);
+            content_len = g_xb - xb_before;
+            addXSpan(xb_before, content_len);
+        } else {
+            // The ',' separator goes BEFORE a normal field (not after the
+            // previous one): the next field may be an extra field, which
+            // never reaches the output, and an eagerly-emitted ',' would
+            // be left dangling before ']'.
+            if (g_field_count > 0) outByte(&out, ',');
+            outByte(&out, '"');
+            const ob = out;
+            kind = readField(&out);
+            content_len = out - ob;
+            outByte(&out, '"');
+        }
+        if (g_field_count == 0) {
+            g_field1_len = content_len;
+            g_field1_quoted = g_fld_quoted;
+        }
+        g_field_count += 1;
+        if (kind == F_COMMA) {
+            continue;
+        }
         break;
     }
-    return kind;
-}
-
-// Parse the next non-dropped record into the spans. Returns true if a record
-// was found, false at end of text. Sets cs_rec_line / cs_rec_row.
-fn parseNextRecord() bool {
-    while (true) {
-        skipEmptyLines();
-        if (cs_pos >= cs_end) return false;
-        cs_rec_line = cs_line;
-        cs_rec_row = if (cs_header and !cs_cols_done) -1 else @intCast(cs_rows);
-        const ok = tryFastRecord();
-        if (!ok) {
-            _ = parseSlowRecord();
+    // drop check BEFORE short/long: exactly one empty unquoted field
+    if (g_field_count == 1 and g_field1_len == 0 and !g_field1_quoted) {
+        g_out = g_rec_start;
+        return REC_DROPPED;
+    }
+    // kept: short/long handling (only when the width is already set)
+    if (cs_width >= 0) {
+        const w: u32 = @intCast(cs_width);
+        if (g_field_count < w) {
+            errShortRow();
+            var j = g_field_count;
+            while (j < w) : (j += 1) {
+                outByte(&out, ',');
+                outLit(&out, "\"\"");
+            }
+        } else if (g_is_long) {
+            errLongRow();
         }
-        // drop a record that held only one empty unquoted field
-        if (g_nspans == 1 and getSpanLen(0) == 0 and !g_last_quoted) {
-            continue; // dropped (its errors stay); parse the next record
-        }
-        return true;
     }
-}
-
-// ---------------- record emission ----------------
-inline fn emitRecordArray() void {
-    outByte('[');
-    var i: u32 = 0;
-    while (i < g_nspans) : (i += 1) {
-        if (i > 0) outByte(',');
-        outByte('"');
-        outSlice(getSpanPtr(i), getSpanLen(i));
-        outByte('"');
-    }
-    outByte(']');
-}
-// Emit a row with exactly `nemit` fields, padded with "" up to `pad_to`.
-fn emitRowFields(nemit: u32, pad_to: u32) void {
-    outByte('[');
-    var i: u32 = 0;
-    while (i < nemit) : (i += 1) {
-        if (i > 0) outByte(',');
-        outByte('"');
-        outSlice(getSpanPtr(i), getSpanLen(i));
-        outByte('"');
-    }
-    var j = nemit;
-    while (j < pad_to) : (j += 1) {
-        if (j > 0) outByte(',');
-        outLit("\"\"");
-    }
-    outByte(']');
+    outByte(&out, ']');
+    g_out = out;
+    return REC_KEPT;
 }
 
 fn hexVal(c: u8) u8 {
@@ -1045,75 +1079,65 @@ fn processCase(text_start: u32, text_end: u32, header: bool) void {
     } else if (isBomEscape(cs_start)) {
         cs_pos = cs_start + 6;
     }
-    outLit("{\"columns\":");
-    if (!parseNextRecord()) {
+    outLit(&g_out, "{\"columns\":");
+    if (!header) outLit(&g_out, "null,\"rows\":[");
+    var first_kept = false;
+    var rows_sep = false; // whether the next row needs a leading ','
+    while (true) {
+        const emit_sep = if (header and !first_kept) false else rows_sep;
+        const res = parseEmitRecord(emit_sep);
+        if (res == REC_END) break;
+        if (res == REC_DROPPED) continue;
+        // KEPT
+        if (!first_kept) {
+            first_kept = true;
+            cs_width = @intCast(g_field_count);
+            if (header) {
+                cs_cols_done = true;
+                outLit(&g_out, ",\"rows\":[");
+                rows_sep = false;
+            } else {
+                cs_rows = 1;
+                rows_sep = true;
+            }
+        } else {
+            cs_rows += 1;
+            rows_sep = true;
+        }
+    }
+    if (!first_kept) {
         // no records at all (errors from dropped records still apply)
         if (header) {
-            outLit("[]");
+            outLit(&g_out, "[],\"rows\":[],\"errors\":[");
         } else {
-            outLit("null");
+            outLit(&g_out, "],\"errors\":[");
         }
-        outLit(",\"rows\":[],\"errors\":[");
-        outSlice(ERR_BASE, g_err_len);
-        outLit("]}");
+        outSlice(&g_out, ERR_BASE, g_err_len);
+        outLit(&g_out, "]}");
         return;
     }
-    // first record found; it sets the width
-    cs_width = @intCast(g_nspans);
-    if (header) {
-        emitRecordArray(); // columns
-        cs_cols_done = true;
-    } else {
-        outLit("null");
-    }
-    outLit(",\"rows\":[");
-    if (!header) {
-        // first record is row 0
-        emitRecordArray();
-        cs_rows = 1;
-    }
-    // subsequent records
-    while (parseNextRecord()) {
-        const w: u32 = @intCast(cs_width);
-        if (g_nspans < w) {
-            errShortRow();
-            if (cs_rows > 0) outByte(',');
-            emitRowFields(g_nspans, w);
-            cs_rows += 1;
-        } else if (g_nspans > w) {
-            errLongRow();
-            if (cs_rows > 0) outByte(',');
-            emitRowFields(w, w);
-            cs_rows += 1;
-        } else {
-            if (cs_rows > 0) outByte(',');
-            emitRecordArray();
-            cs_rows += 1;
-        }
-    }
-    outLit("],\"errors\":[");
-    outSlice(ERR_BASE, g_err_len);
-    outLit("]}");
+    outLit(&g_out, "],\"errors\":[");
+    outSlice(&g_out, ERR_BASE, g_err_len);
+    outLit(&g_out, "]}");
 }
 
 // ---------------- entry point ----------------
 
-// Run the whole cases.json (at in_ptr, in_len bytes) and write answers.json
-// to OUT_BASE. Returns the output length in bytes. The caller (JS) reads
-// [OUT_BASE, OUT_BASE + len) from the exported memory.
-// Grow linear memory to 1024 pages (64 MiB) if smaller. Call once before
+// Grow linear memory to 544 pages (34 MiB) if smaller. Call once before
 // writing the input.
 export fn init() void {
-    const need_pages: u32 = 1024;
+    const need_pages: u32 = 544;
     const cur = @wasmMemorySize(0);
     if (cur < need_pages) {
         _ = @wasmMemoryGrow(0, need_pages - cur);
     }
 }
 
+// Run the whole cases.json (at in_ptr, in_len bytes) and write answers.json
+// to OUT_BASE. Returns the output length in bytes. The caller (JS) reads
+// [OUT_BASE, OUT_BASE + len) from the exported memory.
 export fn run_json(in_ptr: u32, in_len: u32) u32 {
-    // Ensure enough linear memory (1024 pages = 64 MiB).
-    const need_pages: u32 = 1024;
+    const need_pages: u32 = 544;
     const cur = @wasmMemorySize(0);
     if (cur < need_pages) {
         _ = @wasmMemoryGrow(0, need_pages - cur);
@@ -1123,11 +1147,11 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
     var p = skipWs(in_ptr);
     // top-level '['
     if (p < g_in_end and b8(p) == '[') p += 1;
-    outByte('[');
+    outByte(&g_out, '[');
     var first = true;
     p = skipWs(p);
     if (p < g_in_end and b8(p) == ']') {
-        outByte(']');
+        outByte(&g_out, ']');
         return g_out - OUT_BASE;
     }
     while (true) {
@@ -1136,7 +1160,7 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
         var te: u32 = 0;
         var hdr: bool = false;
         p = parseCase(p, &ts, &te, &hdr);
-        if (!first) outByte(',');
+        if (!first) outByte(&g_out, ',');
         first = false;
         processCase(ts, te, hdr);
         p = skipWs(p);
@@ -1146,7 +1170,7 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
         }
         break; // ']'
     }
-    outByte(']');
+    outByte(&g_out, ']');
     return g_out - OUT_BASE;
 }
 
