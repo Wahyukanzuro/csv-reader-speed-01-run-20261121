@@ -1,5 +1,7 @@
-// csv-reader-speed-01 v6: v4 (in-memory single-pass) + clean-line
-// multi-comma @ctz fast path.
+// csv-reader-speed-01 v7: v6 + (1) static memory + per-case flushOut
+// (no memory.grow, one reusable 2.5 MiB output buffer, flushed after each
+// case) + (2) 16-byte SIMD128 escaped-byte scanner for quoted/unquoted
+// fields. See BUILD-REPORT.md for the design and the numbers.
 //
 // v6 keeps v4's in-memory single-pass engine (NO streaming pump, NO
 // header pre-scan — v5 proved streaming costs more than it saves: the
@@ -43,20 +45,24 @@
 
 const std = @import("std");
 
-// ---------------- memory layout (initial 544 pages = 34 MiB) ----------------
-// input buffer: IN_BASE .. (written by JS, read-only for us)
-// output buffer: OUT_BASE .. (answers.json, ~12 MiB)
-// scratch: SCRATCH_BASE .. (errors buffer, extra-field buffer, extra spans)
-// Layout is packed tight to minimise the init() memory-grow cost (growing
-// zeroes the new pages) and gVisor page faults: input 2 MiB (above the
-// ~1 MiB data segment), output 15 MiB (input is <= ~13 MiB, so the gap is
-// ~1 MiB, not v3's 7 MiB), scratch 30 MiB (output <= ~15 MiB, gap ~2 MiB).
-// Total 34 MiB (544 pages) vs v3's 40 MiB (640 pages). Bounds (safe for
-// the generator's data: input <= ~12 MiB, output <= ~13 MiB):
-// input [2, 15), output [15, 30), scratch [30, 34).
+// ---------------- memory layout (STATIC, 336 pages = 21 MiB) ----------------
+// v7: static memory, NO memory.grow. The size is declared at link time
+// (--initial-memory=22020096 --max-memory=22020096) so init()/run_json
+// never grow. This removes the grow syscall AND the ~10 MiB of output
+// pages v6 touched: the output buffer is now ONE reusable 2.5 MiB window
+// (a case's output is at most ~2.21 MiB; the buffer is flushed to the
+// output file after each case and then reused), so only 2.5 MiB of output
+// pages ever fault in instead of ~12 MiB.
+// Layout (same input assumption as v6: input <= ~13 MiB):
+// input [2, 15), output [15, 17.5), scratch [18, ~20.1).
+// Hardcoded windows avoid [0xF0000, 0x101000) (Zig stack/globals live
+// there; see v5's overlap bug). IN_BASE 2 MiB is above the ~1 MiB data
+// segment, as in v6.
 const IN_BASE: u32 = 0x200000; // 2 MiB (input; JS writes here)
-const OUT_BASE: u32 = 0xF00000; // 15 MiB
-const SCRATCH_BASE: u32 = 0x1E00000; // 30 MiB
+const OUT_BASE: u32 = 0xF00000; // 15 MiB (reusable per-case output buffer)
+const OUT_CAP: u32 = 0x280000; // 2.5 MiB per-case output buffer
+const OUT_FLUSH_RESERVE: u32 = 0x40000; // 256 KiB safety reserve: a single record emits at most ~1 KiB and a case's trailing errors at most ~32 KiB, so flushing when <256 KiB remains can never overflow the buffer
+const SCRATCH_BASE: u32 = 0x1200000; // 18 MiB
 const ERR_BASE: u32 = SCRATCH_BASE; // errors JSON fragments, cap 1 MiB
 const ERR_CAP: u32 = 0x100000;
 const XB_BASE: u32 = SCRATCH_BASE + 0x100000; // extra field values (long rows), 1 MiB
@@ -101,6 +107,13 @@ const F_END: u8 = 2;
 const REC_END: u8 = 0; // no more records
 const REC_KEPT: u8 = 1; // record emitted
 const REC_DROPPED: u8 = 2; // record dropped (rewound)
+
+// JS import: flush the output buffer [ptr, ptr+len) to /output/answers.json.
+// Called after each case (and as a mid-case safety flush inside
+// parseEmitRecord). The JS side writes the bytes with fs.writeSync; the
+// buffer is then reused for the next case. Imported from the "env" module
+// (the JS driver passes { env: { flushOut } } at instantiation).
+extern fn flushOut(ptr: u32, len: u32) void;
 
 // ---------------- low-level memory access ----------------
 inline fn b8(p: u32) u8 {
@@ -160,28 +173,22 @@ fn outU32(dst: *u32, n: u32) void {
     for (buf[i..10]) |c| outByte(dst, c);
 }
 
-// ---------------- SIMD scanning (32-byte windows) ----------------
+// ---------------- SIMD scanning (16-byte windows) ----------------
+// v7: 16-byte windows (one v128 per iteration). v6 used 32-byte windows;
+// 64-byte was proven slower twice (Liftoff I-cache). The 16-byte loop
+// body is smaller (friendlier to the I-cache) and the escaped-byte
+// scanner below needs only one splat per iteration. Measured A/B vs the
+// 32-byte version in BUILD-REPORT.md (kept only if faster).
 // Find the next position >= pos where the byte is '\\', up to end.
-// Returns end if none. 32-byte windows (v4's proven-faster choice:
-// 64-byte windows measured 13.13 ms vs 32-byte 12.04 ms warm run_json —
-// the smaller unrolled code is friendlier to the Liftoff I-cache).
+// Returns end if none.
 inline fn findBs(pos: u32, end: u32) u32 {
     var p = pos;
     const splat: @Vector(16, u8) = @splat('\\');
-    while (p + 32 <= end) {
-        var m: u32 = 0;
-        inline for (0..2) |i| {
-            const chunk = load16(p + @as(u32, @intCast(i * 16)));
-            const b: u16 = @bitCast(chunk == splat);
-            m |= @as(u32, b) << @as(u5, @intCast(i * 16));
-        }
-        if (m != 0) return p + @ctz(m);
-        p += 32;
-    }
-    while (p + 16 <= end) : (p += 16) {
+    while (p + 16 <= end) {
         const chunk = load16(p);
         const mm: u16 = @bitCast(chunk == splat);
         if (mm != 0) return p + @ctz(mm);
+        p += 16;
     }
     while (p < end) : (p += 1) {
         if (b8(p) == '\\') return p;
@@ -191,26 +198,16 @@ inline fn findBs(pos: u32, end: u32) u32 {
 
 // Find the next position >= pos where the byte is ',' or '\\', up to end.
 // Returns end if none. (Unquoted-field scan: ',' ends the field, '\\'
-// starts an escape that must be classified.) 32-byte windows (v4's
-// proven-faster choice; see findBs).
+// starts an escape that must be classified.) 16-byte windows (see findBs).
 inline fn findCommaOrBs(pos: u32, end: u32) u32 {
     var p = pos;
     const c_splat: @Vector(16, u8) = @splat(',');
     const b_splat: @Vector(16, u8) = @splat('\\');
-    while (p + 32 <= end) {
-        var m: u32 = 0;
-        inline for (0..2) |i| {
-            const chunk = load16(p + @as(u32, @intCast(i * 16)));
-            const b: u16 = @bitCast((chunk == c_splat) | (chunk == b_splat));
-            m |= @as(u32, b) << @as(u5, @intCast(i * 16));
-        }
-        if (m != 0) return p + @ctz(m);
-        p += 32;
-    }
-    while (p + 16 <= end) : (p += 16) {
+    while (p + 16 <= end) {
         const chunk = load16(p);
         const mm: u16 = @bitCast((chunk == c_splat) | (chunk == b_splat));
         if (mm != 0) return p + @ctz(mm);
+        p += 16;
     }
     while (p < end) : (p += 1) {
         const c = b8(p);
@@ -255,6 +252,10 @@ fn parseJsonString(p: u32) StrSpan {
     const q_splat: @Vector(16, u8) = @splat('"');
     const b_splat: @Vector(16, u8) = @splat('\\');
     while (q < g_in_end) {
+        // 32-byte windows for the long clean stretches (v6's proven
+        // choice): the 16-byte variant measured ~0.27 ms SLOWER warm
+        // median (A/B batch 3 vs batch 2) -- for this scan the unrolled
+        // 32-byte loop's throughput beats the smaller loop body.
         if (q + 32 <= g_in_end) {
             var mq: u32 = 0;
             var mb: u32 = 0;
@@ -969,6 +970,20 @@ fn tryFastCleanRecord(emit_sep: bool) ?u8 {
 // The drop check runs BEFORE any short_row/long_row handling: a dropped
 // record gets no short_row/long_row error (vendor order).
 fn parseEmitRecord(emit_sep: bool) u8 {
+    // Mid-case safety flush: if the reusable output buffer is nearly full,
+    // flush it now so a single record can never overflow the 2.5 MiB
+    // per-case buffer. A record emits at most ~1 KiB and a case's trailing
+    // errors at most ~32 KiB, so the 256 KiB reserve is far more than
+    // enough. This almost never fires (a case is at most ~2.21 MiB); it
+    // only guards against a larger-than-practice final case. The check
+    // runs before tryFastCleanRecord / the local `out` is taken, so both
+    // paths see the reset position. Dropped records rewind g_out to
+    // g_rec_start (set after this check), so flushed bytes are never
+    // rewound.
+    if (g_out - OUT_BASE > OUT_CAP - OUT_FLUSH_RESERVE) {
+        flushOut(OUT_BASE, g_out - OUT_BASE);
+        g_out = OUT_BASE;
+    }
     skipEmptyLines();
     if (cs_pos >= cs_end) return REC_END;
     cs_rec_line = cs_line;
@@ -1123,27 +1138,23 @@ fn processCase(text_start: u32, text_end: u32, header: bool) void {
 
 // ---------------- entry point ----------------
 
-// Grow linear memory to 544 pages (34 MiB) if smaller. Call once before
-// writing the input.
-export fn init() void {
-    const need_pages: u32 = 544;
-    const cur = @wasmMemorySize(0);
-    if (cur < need_pages) {
-        _ = @wasmMemoryGrow(0, need_pages - cur);
-    }
-}
+// Static memory (declared at link time with --initial-memory=22020096
+// --max-memory=22020096), so init() is a no-op: there is nothing to grow.
+// Kept as an export so the JS driver (a.cjs / solve.mjs) is unchanged.
+export fn init() void {}
 
-// Run the whole cases.json (at in_ptr, in_len bytes) and write answers.json
-// to OUT_BASE. Returns the output length in bytes. The caller (JS) reads
-// [OUT_BASE, OUT_BASE + len) from the exported memory.
+// Run the whole cases.json (at in_ptr, in_len bytes). The output is
+// flushed to /output/answers.json through the flushOut import AFTER EACH
+// CASE (6 flushes) plus one final flush for the closing ']' — the
+// concatenated flushed bytes are byte-identical to v6's single 12,073,155 B
+// answers.json ([ + case0 + , + case1 + ... + , + case5 + ]).
+// The output buffer (2.5 MiB) is reused per case: g_out is reset to
+// OUT_BASE after every flush, so only 2.5 MiB of output pages ever fault
+// in. Returns the total bytes flushed.
 export fn run_json(in_ptr: u32, in_len: u32) u32 {
-    const need_pages: u32 = 544;
-    const cur = @wasmMemorySize(0);
-    if (cur < need_pages) {
-        _ = @wasmMemoryGrow(0, need_pages - cur);
-    }
     g_in_end = in_ptr + in_len;
     g_out = OUT_BASE;
+    var total: u32 = 0;
     var p = skipWs(in_ptr);
     // top-level '['
     if (p < g_in_end and b8(p) == '[') p += 1;
@@ -1152,7 +1163,10 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
     p = skipWs(p);
     if (p < g_in_end and b8(p) == ']') {
         outByte(&g_out, ']');
-        return g_out - OUT_BASE;
+        flushOut(OUT_BASE, g_out - OUT_BASE);
+        total += g_out - OUT_BASE;
+        g_out = OUT_BASE;
+        return total;
     }
     while (true) {
         p = skipWs(p);
@@ -1163,6 +1177,11 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
         if (!first) outByte(&g_out, ',');
         first = false;
         processCase(ts, te, hdr);
+        // Flush this case's bytes ('[' or ',' prefix + case JSON) and
+        // reuse the buffer for the next case.
+        flushOut(OUT_BASE, g_out - OUT_BASE);
+        total += g_out - OUT_BASE;
+        g_out = OUT_BASE;
         p = skipWs(p);
         if (p < g_in_end and b8(p) == ',') {
             p += 1;
@@ -1171,7 +1190,10 @@ export fn run_json(in_ptr: u32, in_len: u32) u32 {
         break; // ']'
     }
     outByte(&g_out, ']');
-    return g_out - OUT_BASE;
+    flushOut(OUT_BASE, g_out - OUT_BASE);
+    total += g_out - OUT_BASE;
+    g_out = OUT_BASE;
+    return total;
 }
 
 // Output buffer base (so JS does not hardcode the layout).
